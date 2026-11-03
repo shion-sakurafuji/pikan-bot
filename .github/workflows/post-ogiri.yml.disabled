@@ -1,0 +1,95 @@
+name: Post saboteso ogiri
+
+on:
+
+  workflow_dispatch:
+    inputs:
+      post_to_x:
+        description: "Publish to X? (false: generate text only)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: saboteso-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.SABOTESO_AUTOPUBLISH_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+
+      - name: Load latest main and post history
+        if: ${{ inputs.post_to_x }}
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npx tsx --test src/*.test.ts
+#　GitのActions実験用のために、回答を2回生成するようにしてる。（AIに送るプロンプトの効果を見るため）
+      - name: Dry run (never publish to X)
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.post_to_x }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          OGIRI_COMPARE_MODEL: "gpt-6-luna"
+          X_POST_ENABLED: "false"
+        run: npm run dev
+
+      - name: Prepare a new post
+        id: prepare
+        if: ${{ github.event_name == 'schedule' || inputs.post_to_x }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          POST_SCHEDULE: ${{ github.event.schedule }}
+        run: npx tsx src/prepare-post.ts
+
+      - name: Save the reservation before contacting X
+        if: ${{ steps.prepare.outputs.ready == 'true' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/post-history.json
+          git commit -m "Reserve saboteso post"
+          git push origin HEAD:main
+
+      - name: Publish reserved post to X
+        if: ${{ steps.prepare.outputs.ready == 'true' }}
+        env:
+          POST_SCHEDULE: ${{ github.event.schedule }}
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+        run: npx tsx src/publish-post.ts
+
+      - name: Save the successful X post ID
+        if: ${{ steps.prepare.outputs.ready == 'true' }}
+        run: |
+          git add data/post-history.json
+          git commit -m "Record saboteso post"
+          git push origin HEAD:main

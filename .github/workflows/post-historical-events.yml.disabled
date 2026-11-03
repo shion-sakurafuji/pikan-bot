@@ -1,0 +1,129 @@
+name: Post historical events
+
+on:
+  schedule:
+    - cron: "30 22 * * *"
+    - cron: "5 3 * * *"
+    - cron: "15 9 * * *"
+  workflow_dispatch:
+    inputs:
+      post_slot:
+        description: "投稿枠（日本時間）"
+        required: true
+        type: choice
+        options:
+          - "0730"
+          - "1205"
+          - "1815"
+      posting_date:
+        description: "投稿日（日本時間、YYYY-MM-DD）"
+        required: true
+        type: string
+      post_to_x:
+        description: "Xへ投稿する"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pikan-historical-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.PIKAN_AUTOPUBLISH_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Prepare or reuse today's verified posts
+        id: prepare
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          POST_SCHEDULE: ${{ github.event.schedule }}
+          POST_SLOT: ${{ inputs.post_slot }}
+          POSTING_DATE: ${{ inputs.posting_date }}
+        run: npx tsx src/prepare-historical-posts.ts
+
+      - name: Persist today's plan
+        if: steps.prepare.outcome == 'success'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/historical-posts.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Save historical post plan"
+            git fetch origin main
+            git rebase origin/main
+            git push origin HEAD:main
+          fi
+
+      - name: Reserve this posting slot before contacting X
+        id: reserve
+        if: ${{ steps.prepare.outputs.ready == 'true' && vars.PIKAN_AUTOPUBLISH_ENABLED == 'true' && (github.event_name == 'schedule' || inputs.post_to_x == true) }}
+        env:
+          POST_SCHEDULE: ${{ github.event.schedule }}
+          POST_SLOT: ${{ inputs.post_slot }}
+          POSTING_DATE: ${{ inputs.posting_date }}
+        run: npx tsx src/reserve-historical-post.ts
+
+      - name: Persist the no-retry reservation
+        id: persist-reservation
+        if: steps.reserve.outputs.ready == 'true'
+        run: |
+          git add data/historical-posts.json
+          git commit -m "Reserve historical X post"
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
+
+      - name: Publish the reserved post
+        if: ${{ steps.reserve.outputs.ready == 'true' && vars.PIKAN_AUTOPUBLISH_ENABLED == 'true' && (github.event_name == 'schedule' || inputs.post_to_x == true) }}
+        env:
+          POST_SCHEDULE: ${{ github.event.schedule }}
+          POST_SLOT: ${{ inputs.post_slot }}
+          POSTING_DATE: ${{ inputs.posting_date }}
+          POST_TO_X: ${{ inputs.post_to_x }}
+          PIKAN_AUTOPUBLISH_ENABLED: ${{ vars.PIKAN_AUTOPUBLISH_ENABLED }}
+          X_POST_ENABLED: ${{ vars.PIKAN_AUTOPUBLISH_ENABLED == 'true' && (github.event_name == 'schedule' || inputs.post_to_x == true) }}
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+        run: npx tsx src/publish-historical-post.ts
+
+      - name: Persist the final or uncertain status
+        if: always() && steps.reserve.outputs.ready == 'true' && steps.persist-reservation.outcome == 'success'
+        run: |
+          git add data/historical-posts.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Record historical X post status"
+            git fetch origin main
+            git rebase origin/main
+            git push origin HEAD:main
+          fi
